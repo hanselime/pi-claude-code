@@ -71,6 +71,10 @@ tool execution. In particular, it:
   their stable layout during full-history replay. It removes redundant moving
   reminders and adjusts cache breakpoints so tool rounds do not continually
   invalidate the prompt-cache prefix;
+- removes the `# userEmail` section (the account email) from Claude Code's
+  context reminders in every request, including the first, so the model does
+  not see it. The rest of the reminder, such as the date and CLAUDE.md, is
+  kept;
 - injects supported mid-conversation tool additions and removals at their
   original assistant boundaries and adds the corresponding Anthropic beta
   header; and

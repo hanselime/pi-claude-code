@@ -558,6 +558,58 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
   if (final) setCacheBreakpoint(final);
 }
 
+// Claude Code adds the account email to its context reminder. The model does not need it.
+const USER_EMAIL_SECTION = /^# userEmail\n[^\n]*\n?/gm;
+// Also catches the sentence if Claude Code ever renames the section heading.
+const USER_EMAIL_LINE = /^The user's email address is [^\n]*\n?/gm;
+const SYSTEM_REMINDER = /(\n?)<system-reminder>([\s\S]*?)<\/system-reminder>(\n?)/g;
+
+function stripUserEmailText(text: string): string {
+  if (!text.includes("<system-reminder>")) return text;
+  return text.replace(SYSTEM_REMINDER, (segment, before: string, inner: string, after: string, offset: number) => {
+    const stripped = inner.replace(USER_EMAIL_SECTION, "").replace(USER_EMAIL_LINE, "");
+    if (stripped === inner) return segment;
+    if (/^# /m.test(stripped)) return `${before}<system-reminder>${stripped}</system-reminder>${after}`;
+    // Keep one line break only when the reminder sat between two pieces of text.
+    return offset > 0 && offset + segment.length < text.length ? "\n" : "";
+  });
+}
+
+function isEmptyText(value: unknown): boolean {
+  const record = value as Record<string, unknown> | null;
+  return !!record && typeof record === "object" && record.type === "text" && record.text === "";
+}
+
+function stripUserEmailValue(value: unknown): unknown {
+  if (typeof value === "string") return stripUserEmailText(value);
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(stripUserEmailValue).filter((item) => !isEmptyText(item));
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) record[key] = stripUserEmailValue(record[key]);
+  return record;
+}
+
+// Assistant turns are left untouched: they never carry the reminder and may hold signed thinking.
+function stripUserEmailMessages(messages: unknown[]): NativeRequestMessage[] {
+  return (messages as NativeRequestMessage[])
+    .map((message) =>
+      message.role === "assistant" ? message : { ...message, content: stripUserEmailValue(message.content) },
+    )
+    .filter((message) => message.content !== "" && !(Array.isArray(message.content) && message.content.length === 0));
+}
+
+function stripUserEmailPayload(payload: Record<string, unknown>): void {
+  if (Array.isArray(payload.messages)) payload.messages = stripUserEmailMessages(payload.messages);
+}
+
+/** Remove the account email section from Claude Code's reminders in a Messages request body. */
+export function stripUserEmail(body: Buffer): Buffer {
+  if (!body.includes("<system-reminder>")) return body;
+  const payload = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+  stripUserEmailPayload(payload);
+  return Buffer.from(JSON.stringify(payload));
+}
+
 function removeRepeatedUserReminders(messages: NativeRequestMessage[], prefix: unknown[] | undefined): void {
   const reminder = contentText(prefix).trimEnd();
   if (!reminder || !prefix) return;
@@ -640,12 +692,16 @@ export function rewriteInitialRequest(
     messages?: NativeRequestMessage[];
     system?: unknown;
   };
+  // Strip both sides so reminder comparisons below still match exactly.
+  stripUserEmailPayload(payload);
+  if (prefix) prefix = stripUserEmailValue(structuredClone(prefix)) as unknown[];
+  if (initialSystemMessages) initialSystemMessages = stripUserEmailMessages(structuredClone(initialSystemMessages));
   let messages = payload.messages;
   const first = messages?.[0];
   if (first?.role !== "user" || !Array.isArray(first.content)) {
     throw new Error("Claude Code request is missing its initial user message");
   }
-  if (prefix) first.content = [...structuredClone(prefix), ...structuredClone(canonicalContent)];
+  if (prefix) first.content = stripUserEmailValue([...structuredClone(prefix), ...structuredClone(canonicalContent)]);
 
   if (initialSystemMessages?.length && messages) {
     let systemEnd = 1;
@@ -898,10 +954,9 @@ class ClaudeProcess {
       input.onEvent?.(event);
     };
     const canonicalInitialUser = input.frames.find((frame) => frame.type === "user")?.message.content ?? [];
-    this.relay.beginTurn(
-      deliver,
+    const rewrite =
       input.initialUserPrefix || input.initialSystemMessages || input.nativeSystemInjections
-        ? (body) =>
+        ? (body: Buffer) =>
             rewriteInitialRequest(
               body,
               input.initialUserPrefix,
@@ -909,9 +964,9 @@ class ClaudeProcess {
               input.initialSystemMessages,
               input.nativeSystemInjections,
             )
-        : undefined,
-      input.betas,
-    );
+        : undefined;
+    // rewriteInitialRequest strips the email itself; every other request still needs stripping.
+    this.relay.beginTurn(deliver, rewrite ?? stripUserEmail, input.betas);
 
     const abort = () => {
       this.relay.abort();
