@@ -574,6 +574,48 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
   if (final) setCacheBreakpoint(final);
 }
 
+// Claude Code's reminders carry account and workspace context (email, git status, memory) the model does not need.
+// A match may not pass another opening tag, so a stray tag in file text cannot swallow content up to a real reminder.
+const SYSTEM_REMINDER = /\n?<system-reminder>(?:(?!<system-reminder>)[\s\S])*?<\/system-reminder>\n?/g;
+
+function stripSystemRemindersText(text: string): string {
+  // Keep one line break only when the reminder sat between two pieces of text.
+  return text.replace(SYSTEM_REMINDER, (segment: string, offset: number) =>
+    offset > 0 && offset + segment.length < text.length ? "\n" : "",
+  );
+}
+
+function isEmptyText(value: unknown): boolean {
+  const record = value as Record<string, unknown> | null;
+  return !!record && typeof record === "object" && record.type === "text" && record.text === "";
+}
+
+function stripSystemRemindersValue(value: unknown): unknown {
+  if (typeof value === "string") return stripSystemRemindersText(value);
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(stripSystemRemindersValue).filter((item) => !isEmptyText(item));
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) record[key] = stripSystemRemindersValue(record[key]);
+  return record;
+}
+
+// Assistant turns are left untouched: they never carry reminders and may hold signed thinking.
+function stripSystemRemindersMessages(messages: unknown[]): NativeRequestMessage[] {
+  return (messages as NativeRequestMessage[])
+    .map((message) =>
+      message.role === "assistant" ? message : { ...message, content: stripSystemRemindersValue(message.content) },
+    )
+    .filter((message) => message.content !== "" && !(Array.isArray(message.content) && message.content.length === 0));
+}
+
+/** Remove every `<system-reminder>` block from the non-assistant messages of a Messages request body. */
+export function stripSystemReminders(body: Buffer): Buffer {
+  if (!body.includes("<system-reminder>")) return body;
+  const payload = JSON.parse(body.toString("utf8")) as { messages?: unknown };
+  if (Array.isArray(payload.messages)) payload.messages = stripSystemRemindersMessages(payload.messages);
+  return Buffer.from(JSON.stringify(payload));
+}
+
 function removeRepeatedUserReminders(messages: NativeRequestMessage[], prefix: unknown[] | undefined): void {
   const reminder = contentText(prefix).trimEnd();
   if (!reminder || !prefix) return;
@@ -656,12 +698,20 @@ export function rewriteInitialRequest(
     messages?: NativeRequestMessage[];
     system?: unknown;
   };
+  // Strip before cache breakpoints are placed, and strip the saved copies so comparisons below still match.
+  if (payload.messages) payload.messages = stripSystemRemindersMessages(payload.messages);
+  if (prefix) prefix = stripSystemRemindersValue(structuredClone(prefix)) as unknown[];
+  if (initialSystemMessages) {
+    initialSystemMessages = stripSystemRemindersMessages(structuredClone(initialSystemMessages));
+  }
   let messages = payload.messages;
   const first = messages?.[0];
   if (first?.role !== "user" || !Array.isArray(first.content)) {
     throw new Error("Claude Code request is missing its initial user message");
   }
-  if (prefix) first.content = [...structuredClone(prefix), ...structuredClone(canonicalContent)];
+  if (prefix) {
+    first.content = stripSystemRemindersValue([...structuredClone(prefix), ...structuredClone(canonicalContent)]);
+  }
 
   if (initialSystemMessages?.length && messages) {
     let systemEnd = 1;
@@ -925,10 +975,9 @@ class ClaudeProcess {
       input.onEvent?.(event);
     };
     const canonicalInitialUser = input.frames.find((frame) => frame.type === "user")?.message.content ?? [];
-    this.relay.beginTurn(
-      deliver,
+    const rewrite =
       input.initialUserPrefix || input.initialSystemMessages || input.nativeSystemInjections
-        ? (body) =>
+        ? (body: Buffer) =>
             rewriteInitialRequest(
               body,
               input.initialUserPrefix,
@@ -936,9 +985,9 @@ class ClaudeProcess {
               input.initialSystemMessages,
               input.nativeSystemInjections,
             )
-        : undefined,
-      input.betas,
-    );
+        : undefined;
+    // rewriteInitialRequest strips reminders itself; every other request still needs stripping.
+    this.relay.beginTurn(deliver, rewrite ?? stripSystemReminders, input.betas);
 
     const abort = () => {
       this.relay.abort();

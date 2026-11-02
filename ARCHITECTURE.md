@@ -69,10 +69,14 @@ tool execution. In particular, it:
   it, preserving signed thinking, tool arguments, usage, and the native stop
   reason. This lets Pi retain a valid tool request even when Claude Code later
   reports an `error_max_turns` boundary or a synthetic recovery error;
-- records Claude Code's initial native user and system reminders, then restores
+- records Claude Code's initial native system messages, then restores
   their stable layout during full-history replay. It removes redundant moving
   reminders and adjusts cache breakpoints so tool rounds do not continually
   invalidate the prompt-cache prefix;
+- removes every `<system-reminder>` block from user messages and tool
+  results in every request, including the first. These carry Claude Code's
+  account and workspace context, such as the account email. Assistant turns
+  are left unchanged;
 - injects supported mid-conversation tool additions and removals at their
   original assistant boundaries and adds the corresponding Anthropic beta
   header; and

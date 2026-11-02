@@ -12,6 +12,7 @@ import {
   getClaudeStatus,
   rewriteInitialRequest,
   runClaudeRequest,
+  stripSystemReminders,
 } from "../src/claude-cli.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
 
@@ -86,6 +87,157 @@ test("stabilizes Claude Code's native replay reminders and cache breakpoint", ()
     (rewritten.messages.at(-1)?.content as Array<Record<string, unknown>>).at(-1)?.cache_control,
     { type: "ephemeral", ttl: "1h" },
   );
+});
+
+// Shape of Claude Code 2.1.308's context reminder, with a fake address.
+const REMINDER =
+  "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n" +
+  "# userEmail\nThe user's email address is user@example.com.\n# currentDate\nToday's date is 2026-11-02.\n" +
+  "</system-reminder>\n";
+
+type Body = { messages: Array<{ role: string; content: unknown }> };
+const strip = (body: unknown) =>
+  JSON.parse(stripSystemReminders(Buffer.from(JSON.stringify(body))).toString("utf8")) as Body;
+
+test("strips system reminders from user text and tool results, not assistant turns", () => {
+  const out = strip({
+    model: "claude-sonnet-5",
+    messages: [
+      { role: "user", content: [{ type: "text", text: REMINDER }, { type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: `quoted ${REMINDER}` }] },
+      { role: "user", content: `before\n${REMINDER}after` },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "t1", content: `done\n${REMINDER}` }],
+      },
+      { role: "user", content: [{ type: "text", text: REMINDER }] },
+    ],
+  });
+  assert.deepEqual(out.messages[0]?.content, [{ type: "text", text: "hi" }]);
+  assert.match(JSON.stringify(out.messages[1]), /user@example\.com/, "assistant turns are untouched");
+  assert.equal(out.messages[2]?.content, "before\nafter");
+  assert.equal((out.messages[3]?.content as Array<Record<string, unknown>>)[0]?.content, "done");
+  // A message that held only a reminder is dropped rather than sent empty.
+  assert.equal(out.messages.length, 4);
+  assert.doesNotMatch(JSON.stringify(out.messages.filter((m) => m.role !== "assistant")), /system-reminder/);
+
+  const plain = Buffer.from(JSON.stringify({ messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(stripSystemReminders(plain), plain);
+});
+
+test("a stray opening tag in tool output does not swallow file content", () => {
+  const file = 'line 1\nif (!body.includes("<system-reminder>")) return body;\nline 3\n';
+  const out = strip({
+    messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: `${file}\n${REMINDER}` }] }],
+  });
+  assert.equal((out.messages[0]?.content as Array<Record<string, unknown>>)[0]?.content, file);
+});
+
+test("a replay rebuilds the first message exactly as the first request sent it", () => {
+  const prefix = [{ type: "text", text: REMINDER }];
+  const canonical = [{ type: "text", text: "inspect" }];
+  const initialSystemMessages = [{ role: "system", content: "environment" }];
+  const opening = { role: "user", content: [...prefix, ...canonical] };
+  const parse = (body: Buffer) =>
+    JSON.parse(body.toString("utf8"), (key, value) => (key === "cache_control" ? undefined : value)) as Body;
+
+  const firstRequest = parse(stripSystemReminders(Buffer.from(JSON.stringify({ messages: [opening] }))));
+  const replay = parse(
+    rewriteInitialRequest(
+      Buffer.from(
+        JSON.stringify({
+          messages: [
+            opening,
+            { role: "system", content: "environment" },
+            { role: "assistant", content: [{ type: "text", text: "first reply" }] },
+            { role: "user", content: [...prefix, { type: "text", text: "follow up" }] },
+          ],
+        }),
+      ),
+      prefix,
+      canonical,
+      initialSystemMessages,
+    ),
+  );
+
+  assert.deepEqual(firstRequest.messages[0]?.content, canonical);
+  assert.deepEqual(replay.messages[0], firstRequest.messages[0]);
+  assert.deepEqual(
+    (replay.messages[3]?.content as Array<Record<string, unknown>>).map((block) => block.text),
+    ["follow up"],
+  );
+  assert.doesNotMatch(JSON.stringify(replay), /system-reminder/);
+  assert.match(prefix[0]!.text, /system-reminder/, "caller's saved prefix is not mutated");
+});
+
+test("the relay strips reminders from a new conversation's first request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-code-reminder-"));
+  const workingRoot = await realpath(root);
+  const executable = join(root, "fake-claude.mjs");
+  // A stand-in for Claude Code: it sends its own request, reminder included, through the relay.
+  await writeFile(
+    executable,
+    `#!/usr/bin/env node
+import readline from "node:readline";
+if (process.argv.includes("auth") && process.argv.includes("status")) {
+  console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "test"}));
+  process.exit(0);
+}
+const input = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+for await (const line of input) {
+  const frame = JSON.parse(line);
+  if (frame.type !== "user") continue;
+  const body = {messages: [{role: "user", content: [{type: "text", text: ${JSON.stringify(REMINDER)}}, ...frame.message.content]}]};
+  const response = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {method: "POST", body: JSON.stringify(body)});
+  await response.text();
+  console.log(JSON.stringify({type: "result", subtype: "success", is_error: false}));
+}
+`,
+    "utf8",
+  );
+  await chmod(executable, 0o755);
+
+  const received: string[] = [];
+  const upstream = http.createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    received.push(body);
+    const usage = { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    const events = [
+      { type: "message_start", message: { id: "m1", role: "assistant", content: [], usage } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage },
+      { type: "message_stop" },
+    ];
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const port = (upstream.address() as { port: number }).port;
+
+  try {
+    const result = await runClaudeRequest({
+      model: "sonnet",
+      cwd: workingRoot,
+      frames: [{ type: "user", message: { role: "user", content: [{ type: "text", text: "hello" }] } }],
+      systemPrompt: "system",
+      manifest: [],
+      extraBody: { tools: [] },
+      env: { PI_CLAUDE_CODE_COMMAND: executable },
+      upstreamUrl: `http://127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    assert.equal(result.relay.upstreamRequests, 1);
+    assert.equal(received.length, 1);
+    assert.doesNotMatch(received[0]!, /system-reminder|user@example\.com/);
+    assert.match(received[0]!, /hello/);
+  } finally {
+    await closeClaudeProcesses();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("injects native system history at assistant boundaries", () => {
