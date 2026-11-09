@@ -807,6 +807,51 @@ function restoreCanonicalUserContent(messages: NativeRequestMessage[], frames: N
   });
 }
 
+// Claude Code's reminders carry account and workspace context (email, git status, memory) the model does not need.
+// A match may not pass another opening tag, so a stray tag in a system message cannot swallow text up to a real reminder.
+const SYSTEM_REMINDER = /\n?<system-reminder>(?:(?!<system-reminder>)[\s\S])*?<\/system-reminder>\n?/g;
+
+function stripSystemRemindersText(text: string): string {
+  // Keep one line break only when the reminder sat between two pieces of text.
+  return text.replace(SYSTEM_REMINDER, (segment: string, offset: number) =>
+    offset > 0 && offset + segment.length < text.length ? "\n" : "",
+  );
+}
+
+function isEmptyText(value: unknown): boolean {
+  const record = value as Record<string, unknown> | null;
+  return !!record && typeof record === "object" && record.type === "text" && record.text === "";
+}
+
+function stripSystemRemindersValue(value: unknown): unknown {
+  if (typeof value === "string") return stripSystemRemindersText(value);
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(stripSystemRemindersValue).filter((item) => !isEmptyText(item));
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) record[key] = stripSystemRemindersValue(record[key]);
+  return record;
+}
+
+// Only Claude Code's system messages: user content is rebuilt from Pi's history, so reminder-like text a user
+// wrote survives, and assistant turns may hold signed thinking.
+function stripSystemRemindersMessages(messages: NativeRequestMessage[]): NativeRequestMessage[] {
+  return messages
+    .map((message) => {
+      if (message.role !== "system") return message;
+      // Keep Claude Code's breakpoint on this message even if it marked a dropped block.
+      const marker = Array.isArray(message.content)
+        ? (message.content.findLast((block) => isBlock(block) && block.cache_control) as ContentBlock | undefined)
+            ?.cache_control
+        : undefined;
+      const content = stripSystemRemindersValue(message.content);
+      if (marker && Array.isArray(content) && isBlock(content.at(-1))) {
+        content[content.length - 1] = { ...(content.at(-1) as ContentBlock), cache_control: marker };
+      }
+      return { ...message, content };
+    })
+    .filter((message) => message.content !== "" && !(Array.isArray(message.content) && message.content.length === 0));
+}
+
 function injectNativeSystemMessages(
   messages: NativeRequestMessage[],
   injections: NativeSystemInjection[],
@@ -875,7 +920,10 @@ export function rewriteInitialRequest(
     payload.messages = messages;
     if (Array.isArray(payload.system)) setCacheBreakpoint({ content: payload.system });
   }
-  if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
+  // Strip after the saved system messages are restored, so the first request and every replay match.
+  messages = stripSystemRemindersMessages(messages!);
+  payload.messages = messages;
+  if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages);
 
   return Buffer.from(JSON.stringify(payload));
 }

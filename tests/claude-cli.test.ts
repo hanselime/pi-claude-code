@@ -226,6 +226,56 @@ test("refuses requests that do not line up with Pi's history", () => {
   );
 });
 
+// Shape of Claude Code 2.1.308's context reminder, with a fake address.
+const REMINDER =
+  "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n" +
+  "# userEmail\nThe user's email address is user@example.com.\n# currentDate\nToday's date is 2026-11-02.\n" +
+  "</system-reminder>\n";
+
+test("strips system reminders from system messages only", () => {
+  const canonical = [
+    { role: "user", content: [text("hi")] },
+    { role: "assistant", content: [text(`quoted ${REMINDER}`)] },
+    { role: "user", content: [text("next")] },
+  ];
+  const marker = { type: "ephemeral", ttl: "1h" };
+  const out = rewrite(
+    [
+      canonical[0]!,
+      { role: "system", content: `environment mentions <system-reminder> literally\n${REMINDER}date` },
+      { role: "system", content: [text(REMINDER)] },
+      { role: "system", content: [text("tail"), { ...text(REMINDER), cache_control: marker }] },
+      canonical[1]!,
+      canonical[2]!,
+    ],
+    framesFor(canonical),
+  );
+  // A stray opening tag does not swallow text up to the real reminder.
+  assert.equal(out[1]?.content, "environment mentions <system-reminder> literally\ndate");
+  // A message that held only a reminder is dropped rather than sent empty.
+  assert.equal(out.length, 5);
+  // A breakpoint on a dropped block moves to the block before it.
+  assert.deepEqual(out[2]?.content, [{ ...text("tail"), cache_control: marker }]);
+  assert.match(JSON.stringify(out[3]), /user@example\.com/, "assistant turns are untouched");
+  assert.deepEqual(out[0]?.content, canonical[0]!.content);
+  assert.doesNotMatch(JSON.stringify(out.filter((m) => m.role !== "assistant")), /user@example\.com/);
+});
+
+test("a replay rebuilds the system messages exactly as the first request sent them", () => {
+  const canonical = [{ role: "user", content: [text("inspect")] }];
+  const system = { role: "system", content: `environment\n${REMINDER}` };
+  const first = rewrite([canonical[0]!, system], framesFor(canonical));
+  const later = [
+    ...canonical,
+    { role: "assistant", content: [text("first reply")] },
+    { role: "user", content: [text("follow up")] },
+  ];
+  // The captured copy still holds the reminder; the replay must strip it the same way.
+  const replay = rewrite([later[0]!, system, later[1]!, later[2]!], framesFor(later), [structuredClone(system)]);
+  assert.deepEqual(withoutMarkers(replay[1]), withoutMarkers(first[1]));
+  assert.doesNotMatch(JSON.stringify(replay), /system-reminder/);
+});
+
 test("injects native system history at assistant boundaries", () => {
   const body = {
     system: [

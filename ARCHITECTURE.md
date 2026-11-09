@@ -80,7 +80,9 @@ tool execution. In particular, it:
 - records Claude Code's initial native system messages (environment, date),
   then restores their stable layout during full-history replay. It also adjusts
   cache breakpoints so tool rounds do not continually invalidate the
-  prompt-cache prefix;
+  prompt-cache prefix. Any `<system-reminder>` block in those system messages
+  is removed on every request, so account context cannot reach the model there
+  either;
 - injects supported mid-conversation tool additions and removals at their
   original assistant boundaries and adds the corresponding Anthropic beta
   header; and
