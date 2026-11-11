@@ -95,7 +95,7 @@ test("streams text, thinking and redacted thinking the same way as the final mes
   ];
   const { message, seen } = await streamFakeTurn(
     [
-      { type: "message_start", message: { id: "m_fake", role: "assistant", content: [] } },
+      { type: "message_start", message: { id: "m_fake", model: "claude-opus-5-6", role: "assistant", content: [] } },
       ...content.flatMap((item, index) => block(index, item)),
       { type: "message_delta", delta: { stop_reason: "end_turn" } },
       { type: "message_stop" },
@@ -105,6 +105,7 @@ test("streams text, thinking and redacted thinking the same way as the final mes
     "success",
   );
   assert.equal(message.stopReason, "stop", message.errorMessage);
+  assert.equal(message.responseModel, "claude-opus-5-6");
   assert.deepEqual(seen.filter((type) => type.endsWith("_start")), ["text_start", "thinking_start", "thinking_start"]);
   assert.deepEqual(message.content, [
     { type: "text", text: "" },
